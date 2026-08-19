@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
-Token-based multi-account Discord runner with human-like interactions.
-
-- Reads tokens.txt (one entry per line: token:channel_id)
-- Uses persistent Chrome profiles in PROFILES_DIR
-- Injects token via multiple strategies with read-back verification
-- Simulates human-like mouse movement and typing when sending chat messages
-
-This variant will not abort when injection verification fails; it will continue to open the channel and proceed.
+Bot runner that reads configuration from config.py (no .env), performs a single CDP token injection attempt
+and proceeds even if verification fails. Intervals support range strings (e.g. "3-5" or "3.5-5.5").
 """
 import os
 import time
 import logging
 import hashlib
 import random
+from itertools import cycle
 from concurrent.futures import ThreadPoolExecutor
-from dotenv import load_dotenv
+from typing import Optional
+
+import config
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -26,22 +23,15 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
-# Load config
-load_dotenv()
-GUILD_ID = os.getenv("GUILD_ID") or ""
-PROFILES_DIR = os.getenv("PROFILES_DIR") or "profiles"
-TOKENS_FILE = os.getenv("TOKENS_FILE") or "tokens.txt"
-CONCURRENCY = int(os.getenv("CONCURRENCY") or "1")  # default 1 for safety
-LOG_FILE = os.getenv("LOG_FILE") or "multi_token_runner.log"
-
-# Commands and behavior
-COMMANDS = [
-    "hello everyone",
-    "how's it going?",
-    "this is a test message"
-]
-COMMAND_INTERVAL = int(os.getenv("COMMAND_INTERVAL") or "20")
-ROUNDS_PER_ACCOUNT = int(os.getenv("ROUNDS_PER_ACCOUNT") or "3")
+# Load config values
+GUILD_ID = config.GUILD_ID
+PROFILES_DIR = config.PROFILES_DIR
+TOKENS_FILE = config.TOKENS_FILE
+CONCURRENCY = config.CONCURRENCY
+COMMANDS = config.COMMANDS
+COMMAND_INTERVAL_CFG = config.COMMAND_INTERVAL
+ROUNDS_PER_ACCOUNT = config.ROUNDS_PER_ACCOUNT
+LOG_FILE = config.LOG_FILE
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", handlers=[
@@ -55,6 +45,36 @@ def short_id(token: str) -> str:
     return hashlib.sha1(token.encode("utf-8")).hexdigest()[:10]
 
 
+def parse_interval(cfg) -> float:
+    """Parse an interval config value. Accepts:
+    - number (int/float) -> returns float
+    - string "A-B" -> returns random.uniform(A, B)
+    - string number -> float
+    """
+    if isinstance(cfg, (int, float)):
+        return float(cfg)
+    if not isinstance(cfg, str):
+        logger.warning("Invalid COMMAND_INTERVAL type; falling back to 20s")
+        return 20.0
+    s = cfg.strip()
+    if "-" in s:
+        parts = s.split("-", 1)
+        try:
+            a = float(parts[0])
+            b = float(parts[1])
+            lo, hi = (a, b) if a <= b else (b, a)
+            return random.uniform(lo, hi)
+        except Exception:
+            logger.warning(f"Invalid interval range '{cfg}'; falling back to 20s")
+            return 20.0
+    else:
+        try:
+            return float(s)
+        except Exception:
+            logger.warning(f"Invalid interval '{cfg}'; falling back to 20s")
+            return 20.0
+
+
 class HumanLikeDiscord:
     def __init__(self, profile_dir: str):
         self.profile_dir = profile_dir
@@ -66,12 +86,15 @@ class HumanLikeDiscord:
         opts.add_argument("--window-size=1200,900")
         opts.add_argument("--no-first-run")
         opts.add_argument("--no-default-browser-check")
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension", False)
+        if getattr(config, "CHROME_OPTIONS", {}).get("disable_automation_features", True):
+            opts.add_argument("--disable-blink-features=AutomationControlled")
+            opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+            opts.add_experimental_option("useAutomationExtension", False)
+
         if self.profile_dir:
             os.makedirs(self.profile_dir, exist_ok=True)
             opts.add_argument(f"--user-data-dir={os.path.abspath(self.profile_dir)}")
+
         svc = Service(ChromeDriverManager().install())
         self.driver = webdriver.Chrome(service=svc, options=opts)
         self.driver.set_page_load_timeout(60)
@@ -84,145 +107,61 @@ class HumanLikeDiscord:
         except Exception:
             pass
 
-    def _attempt_cdp_add_script(self, script_src: str) -> bool:
-        try:
-            self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": script_src})
-            logger.debug("CDP addScriptToEvaluateOnNewDocument succeeded")
-            return True
-        except Exception as e:
-            logger.debug(f"CDP addScriptToEvaluateOnNewDocument failed: {e}")
-            return False
-
-    def _attempt_runtime_eval(self, script_src: str) -> bool:
-        try:
-            self.driver.execute_cdp_cmd("Runtime.evaluate", {"expression": script_src, "awaitPromise": False})
-            logger.debug("CDP Runtime.evaluate succeeded")
-            return True
-        except Exception as e:
-            logger.debug(f"CDP Runtime.evaluate failed: {e}")
-            return False
-
-    def _read_local_storage_token(self):
+    def _read_local_storage_token(self) -> Optional[str]:
         try:
             return self.driver.execute_script("return window.localStorage.getItem('token')")
         except Exception as e:
             logger.debug(f"read_local_storage_token error: {e}")
             return None
 
-    def inject_token(self, token: str, max_retries: int = 2) -> bool:
+    def inject_token_once(self, token: str) -> bool:
+        """Single injection attempt using CDP addScriptToEvaluateOnNewDocument.
+        If verification fails, return False quickly.
         """
-        Attempt token injection via multiple methods with retries and verify by reading back localStorage.
-        Returns True on likely success.
-        If verification fails, this function will log info and return False, but the caller will continue.
-        """
-        # Prepare strings
-        safe_for_js = token.replace("\\", "\\\\").replace('"', '\\"')
-        # Value we will set in localStorage (the stored value should include surrounding quotes)
-        js_value_literal = f'\\"{safe_for_js}\\"'  # used inside JS string literal
-        script = f'window.localStorage.setItem("token", "{js_value_literal}");'
-        expected_stored = f'"{token}"'  # what getItem('token') should return
+        try:
+            safe = token.replace("\\", "\\\\").replace('"', '\\"')
+            js_value_literal = f'\\"{safe}\\"'
+            script = f'window.localStorage.setItem("token", "{js_value_literal}");'
 
-        for attempt in range(1, max_retries + 1):
-            logger.info(f"Token injection attempt {attempt}/{max_retries}")
+            # Try one CDP call to add script on new document
+            try:
+                self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": script})
+                logger.info("CDP injection scheduled (single attempt)")
+            except Exception as e:
+                logger.info(f"CDP injection call failed (single attempt): {e}")
+                # As per your decision: do not do additional attempts — proceed to open channel
+                return False
 
-            # 1) Try addScriptToEvaluateOnNewDocument
-            added = self._attempt_cdp_add_script(script)
-
-            # Navigate so a newly-added script runs on page load
+            # Navigate so the injected script runs on load
             try:
                 self.driver.get("https://discord.com/channels/@me")
-            except Exception as e:
-                logger.debug(f"Navigation attempt error: {e}")
-
-            time.sleep(2.0 + random.random() * 2.0)
-
-            # After navigation, read back localStorage to check if the token was set
-            read_back = self._read_local_storage_token()
-            logger.debug(f"Read-back after CDP add attempt: {read_back}")
-            if read_back == expected_stored:
-                logger.info("Token verified in localStorage after CDP addScript")
-                return True
-
-            # 2) Try Runtime.evaluate via CDP (executes immediately in page context)
-            ok = self._attempt_runtime_eval(script)
-            time.sleep(1.0 + random.random())
-            read_back = self._read_local_storage_token()
-            logger.debug(f"Read-back after Runtime.evaluate attempt: {read_back}")
-            if read_back == expected_stored:
-                logger.info("Token verified in localStorage after Runtime.evaluate")
-                return True
-
-            # 3) Fallback: execute_script directly
-            try:
-                self.driver.execute_script(script)
-                logger.debug("execute_script injection attempted")
-            except Exception as e:
-                logger.debug(f"execute_script injection failed: {e}")
-
-            # Wait and read back
-            time.sleep(1.2 + random.random() * 1.5)
-            read_back = self._read_local_storage_token()
-            logger.debug(f"Read-back after execute_script attempt: {read_back}")
-            if read_back == expected_stored:
-                logger.info("Token verified in localStorage after execute_script")
-                return True
-
-            # If not matched, try reload and check again (handles race conditions)
-            try:
-                self.driver.refresh()
             except Exception:
                 pass
-            time.sleep(2.0 + random.random() * 2.0)
+
+            # short wait then check localStorage
+            time.sleep(1.0 + random.random() * 1.0)
             read_back = self._read_local_storage_token()
-            logger.debug(f"Read-back after refresh: {read_back}")
-            if read_back == expected_stored:
-                logger.info("Token verified after refresh")
+            expected = f'"{token}"'
+            logger.debug(f"Single-inject read-back: {read_back}")
+            if read_back == expected:
+                logger.info("Token verified in localStorage after single CDP attempt")
                 return True
+            else:
+                logger.info("Token not verified after single attempt; proceeding to open channel")
+                return False
 
-            # Small delay before next attempt
-            time.sleep(1.5 + random.random() * 2.0)
-
-        # Do not treat verification failure as fatal; log info and let caller continue
-        logger.info("Injection attempts did not verify; continuing without verified injection")
-        return False
-
-    def wait_for_login(self, timeout: int = 30) -> bool:
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                url = self.driver.current_url
-                if "discord.com" in url and "/login" not in url and "/register" not in url:
-                    try:
-                        self.driver.find_element(By.XPATH, "//div[@role='textbox' and @contenteditable='true']")
-                        logger.info("Login detected by message box presence")
-                        return True
-                    except:
-                        try:
-                            self.driver.find_element(By.CSS_SELECTOR, "[data-list-id='guildsnav']")
-                            logger.info("Login detected by guilds nav presence")
-                            return True
-                        except:
-                            if "/channels/" in url:
-                                return True
-            except Exception:
-                pass
-            time.sleep(1.0)
-        logger.warning("Login not detected within timeout")
-        return False
-
-    def navigate_to_channel(self, guild_id: str, channel_id: str):
-        if not guild_id or guild_id == "@me":
-            url = f"https://discord.com/channels/@me/{channel_id}"
-        else:
-            url = f"https://discord.com/channels/{guild_id}/{channel_id}"
-        logger.info(f"Navigating to {url}")
-        try:
-            self.driver.get(url)
-            time.sleep(3.0 + random.random() * 2.0)
-            return True
         except Exception as e:
-            logger.error(f"Navigation failed: {e}")
+            logger.error(f"inject_token_once exception: {e}")
             return False
+
+    def find_message_box(self):
+        try:
+            xpath = "//div[@role='textbox' and @contenteditable='true']"
+            box = WebDriverWait(self.driver, 12).until(EC.element_to_be_clickable((By.XPATH, xpath)))
+            return box
+        except Exception as e:
+            logger.debug(f"find_message_box error: {e}")
+            return None
 
     def _get_element_center(self, element):
         rect = self.driver.execute_script("""
@@ -256,7 +195,7 @@ class HumanLikeDiscord:
                     element.click()
                 except Exception as e:
                     logger.debug(f"Final click fallback failed: {e}")
-            time.sleep(0.15 + random.random() * 0.25)
+            time.sleep(0.12 + random.random() * 0.2)
         except Exception as e:
             logger.debug(f"human_move_to_and_click error: {e}")
             try:
@@ -264,23 +203,14 @@ class HumanLikeDiscord:
             except Exception:
                 pass
 
-    def find_message_box(self):
-        try:
-            xpath = "//div[@role='textbox' and @contenteditable='true']"
-            box = WebDriverWait(self.driver, 12).until(EC.element_to_be_clickable((By.XPATH, xpath)))
-            return box
-        except Exception as e:
-            logger.debug(f"find_message_box error: {e}")
-            return None
-
     def human_type(self, element, text: str):
         try:
             try:
                 self.human_move_to_and_click(element)
-            except:
+            except Exception:
                 try:
                     element.click()
-                except:
+                except Exception:
                     pass
             time.sleep(0.05 + random.random() * 0.12)
             for ch in text:
@@ -323,36 +253,56 @@ def handle_account(token, channel_id, guild_id, profiles_base):
     try:
         logger.info(f"Starting account {aid} -> channel {channel_id}")
         client = HumanLikeDiscord(profile_dir)
-        injected = client.inject_token(token)
+
+        injected = client.inject_token_once(token)
         if not injected:
-            # do not abort; continue to open the channel/profile
-            logger.info(f"Token injection not verified for {aid}; continuing to open channel")
+            logger.info(f"Token injection not verified for {aid}; proceeding to open channel")
 
-        # proceed regardless of injection verification
-        if not client.wait_for_login(timeout=8):
-            logger.debug(f"Login not detected quickly for {aid}; continuing to navigation")
+        # try quick login detection then proceed regardless
+        try:
+            client.driver.get(f"https://discord.com/channels/{guild_id}/{channel_id}")
+        except Exception:
+            # fallback to navigate method
+            client.navigate_to_channel(guild_id, channel_id)
 
-        if not client.navigate_to_channel(guild_id, channel_id):
-            logger.error(f"Cannot navigate for {aid}")
-            return
+        # Infinite or finite loop
+        logger.info("Starting message loop for account")
+        try:
+            if ROUNDS_PER_ACCOUNT == 0:
+                loop_iter = cycle(COMMANDS)
+            else:
+                # finite rounds: produce sequence of length ROUNDS_PER_ACCOUNT cycling commands
+                seq = []
+                for i in range(ROUNDS_PER_ACCOUNT):
+                    seq.append(COMMANDS[i % len(COMMANDS)])
+                loop_iter = iter(seq)
 
-        commands = COMMANDS or []
-        if not commands:
-            logger.warning("No commands configured")
-            return
+            for message in loop_iter:
+                wait_time = parse_interval(COMMAND_INTERVAL_CFG)
+                if wait_time < 0.01:
+                    wait_time = 0.01
+                logger.info(f"Next message will be sent in {wait_time:.1f} seconds: {message}")
+                time.sleep(wait_time)
 
-        for i in range(ROUNDS_PER_ACCOUNT):
-            cmd = commands[i % len(commands)]
-            box = client.find_message_box()
-            if not box:
-                logger.warning(f"No message box found for {aid}")
-                break
-            success = client.human_type(box, cmd)
-            if not success:
-                logger.warning(f"Failed to send message for {aid}")
-            wait_time = COMMAND_INTERVAL + random.uniform(-5, 5)
-            time.sleep(max(1, wait_time))
+                box = client.find_message_box()
+                if not box:
+                    logger.warning(f"No message box for {aid}; will retry after interval")
+                    continue
+
+                ok = client.human_type(box, message)
+                if ok:
+                    logger.info(f"Message sent: {message}")
+                else:
+                    logger.warning(f"Failed to send message: {message}")
+
+                # tiny random pause before next iteration to vary exact timing
+                time.sleep(random.uniform(0.2, 0.8))
+
+        except Exception as loop_exc:
+            logger.error(f"Message loop exception for {aid}: {loop_exc}")
+
         logger.info(f"Finished account {aid}")
+
     except Exception as e:
         logger.error(f"Exception in handle_account {aid}: {e}")
     finally:
@@ -363,7 +313,7 @@ def handle_account(token, channel_id, guild_id, profiles_base):
 def main():
     logger.info("Runner starting")
     if not GUILD_ID:
-        logger.error("GUILD_ID not set in .env")
+        logger.error("GUILD_ID not set in config.py")
         return
     accounts = parse_tokens(TOKENS_FILE)
     if not accounts:
