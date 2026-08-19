@@ -6,6 +6,8 @@ Token-based multi-account Discord runner with human-like interactions.
 - Uses persistent Chrome profiles in PROFILES_DIR
 - Injects token via multiple strategies with read-back verification
 - Simulates human-like mouse movement and typing when sending chat messages
+
+This variant will not abort when injection verification fails; it will continue to open the channel and proceed.
 """
 import os
 import time
@@ -111,6 +113,7 @@ class HumanLikeDiscord:
         """
         Attempt token injection via multiple methods with retries and verify by reading back localStorage.
         Returns True on likely success.
+        If verification fails, this function will log info and return False, but the caller will continue.
         """
         # Prepare strings
         safe_for_js = token.replace("\\", "\\\\").replace('"', '\\"')
@@ -179,7 +182,8 @@ class HumanLikeDiscord:
             # Small delay before next attempt
             time.sleep(1.5 + random.random() * 2.0)
 
-        logger.error("All injection attempts failed")
+        # Do not treat verification failure as fatal; log info and let caller continue
+        logger.info("Injection attempts did not verify; continuing without verified injection")
         return False
 
     def wait_for_login(self, timeout: int = 30) -> bool:
@@ -319,11 +323,15 @@ def handle_account(token, channel_id, guild_id, profiles_base):
     try:
         logger.info(f"Starting account {aid} -> channel {channel_id}")
         client = HumanLikeDiscord(profile_dir)
-        if not client.inject_token(token):
-            logger.error(f"Failed to inject token for {aid}")
-            return
-        if not client.wait_for_login(timeout=35):
-            logger.warning(f"Login not clearly detected for {aid}; continuing")
+        injected = client.inject_token(token)
+        if not injected:
+            # do not abort; continue to open the channel/profile
+            logger.info(f"Token injection not verified for {aid}; continuing to open channel")
+
+        # proceed regardless of injection verification
+        if not client.wait_for_login(timeout=8):
+            logger.debug(f"Login not detected quickly for {aid}; continuing to navigation")
+
         if not client.navigate_to_channel(guild_id, channel_id):
             logger.error(f"Cannot navigate for {aid}")
             return
